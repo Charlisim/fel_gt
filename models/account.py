@@ -30,10 +30,10 @@ class AccountInvoice(models.Model):
     incoterm_fel = fields.Char(string='Incoterm FEL')
     frase_exento_fel = fields.Integer('Fase Exento FEL')
     motivo_fel = fields.Char(string='Motivo FEL')
-    documento_xml_fel = fields.Binary('Documento xml FEL', copy=False)
-    documento_xml_fel_name = fields.Char('Nombre doc xml FEL', default='documento_xml_fel.xml', size=32)
-    resultado_xml_fel = fields.Binary('Resultado xml FEL', copy=False)
-    resultado_xml_fel_name = fields.Char('Resultado doc xml FEL', default='resultado_xml_fel.xml', size=32)
+    documento_xml_fel = fields.Binary('Documento XML FEL', copy=False)
+    documento_xml_fel_name = fields.Char('Nombre archivo XML FEL', default='documento_xml_fel.xml', size=32)
+    resultado_xml_fel = fields.Binary('Resultado XML FEL', copy=False)
+    resultado_xml_fel_name = fields.Char('Resultado archivo XML FEL', default='resultado_xml_fel.xml', size=32)
     certificador_fel = fields.Char('Certificador FEL', copy=False)
     
     def num_a_letras(self, amount):
@@ -175,8 +175,16 @@ class AccountInvoice(models.Model):
         Pais = etree.SubElement(DireccionReceptor, DTE_NS+"Pais")
         Pais.text = factura.partner_id.country_id.code or 'GT'
 
-        if tipo_documento_fel not in ['NDEB', 'NCRE', 'RECI', 'NABN', 'FESP']:
+        ElementoFrases = None
+        if tipo_documento_fel not in ['NABN', 'FESP']:
             ElementoFrases = etree.fromstring(factura.company_id.frases_fel)
+            if datetime.now().isoformat() < '2022-11-01' and tipo_documento_fel not in ['FACT', 'FCAM']:
+                frase_isr = ElementoFrases.find('.//*[@TipoFrase="1"]')
+                if frase_isr is not None:
+                    ElementoFrases.remove(frase_isr)
+                frase_iva = ElementoFrases.find('.//*[@TipoFrase="2"]')
+                if frase_iva is not None:
+                    ElementoFrases.remove(frase_iva)
             DatosEmision.append(ElementoFrases)
 
         Items = etree.SubElement(DatosEmision, DTE_NS+"Items")
@@ -249,9 +257,9 @@ class AccountInvoice(models.Model):
         GranTotal = etree.SubElement(Totales, DTE_NS+"GranTotal")
         GranTotal.text = '{:.3f}'.format(factura.currency_id.round(gran_total))
 
-        if DatosEmision.find("{http://www.sat.gob.gt/dte/fel/0.2.0}Frases") and float_is_zero(gran_total_impuestos, precision_rounding=factura.currency_id.rounding):
+        if ElementoFrases is not None and float_is_zero(gran_total_impuestos, precision_rounding=factura.currency_id.rounding):
             Frase = etree.SubElement(DatosEmision.find("{http://www.sat.gob.gt/dte/fel/0.2.0}Frases"), DTE_NS+"Frase", CodigoEscenario=str(factura.frase_exento_fel) if factura.frase_exento_fel else "1", TipoFrase="4")
-
+            
         if factura.company_id.adenda_fel:
             Adenda = etree.SubElement(SAT, DTE_NS+"Adenda")
             exec(factura.company_id.adenda_fel, {'etree': etree, 'Adenda': Adenda, 'factura': factura})
@@ -318,6 +326,9 @@ class AccountInvoice(models.Model):
                 TotalMenosRetenciones = etree.SubElement(RetencionesFacturaEspecial, CFE_NS+"TotalMenosRetenciones")
                 TotalMenosRetenciones.text = str(factura.amount_total)
 
+        if ElementoFrases is not None and len(ElementoFrases) == 0:
+            DatosEmision.remove(ElementoFrases)
+        
         return GTDocumento
 
     def dte_anulacion(self):
