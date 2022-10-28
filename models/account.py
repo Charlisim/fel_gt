@@ -2,12 +2,15 @@
 
 from odoo import models, fields, api, _
 from odoo.exceptions import UserError, ValidationError
+from odoo.release import version_info
 
-from datetime import datetime
-import base64
 from lxml import etree
+from datetime import datetime
+
+import base64
 import requests
 import re
+import json
 
 import odoo.addons.l10n_gt_extra.a_letras as a_letras
 
@@ -17,6 +20,7 @@ import odoo.addons.l10n_gt_extra.a_letras as a_letras
 #from xades.policy import GenericPolicyId, ImpliedPolicy
 
 import logging
+import re
 
 class AccountMove(models.Model):
     _inherit = "account.move"
@@ -34,9 +38,14 @@ class AccountMove(models.Model):
     documento_xml_fel = fields.Binary('Documento xml FEL', copy=False)
     documento_xml_fel_name = fields.Char('Nombre doc xml FEL', default='documento_xml_fel.xml', size=32)
     resultado_xml_fel = fields.Binary('Resultado xml FEL', copy=False)
-    resultado_xml_fel_name = fields.Char('Resultado doc xml FEL', default='resultado_xml_fel.xml', size=32)
+    resultado_xml_fel_name = fields.Char('Nombre doc xml FEL', default='resultado_xml_fel.xml', size=32)
     certificador_fel = fields.Char('Certificador FEL', copy=False)
     
+    def _get_invoice_reference_odoo_fel(self):
+        """ Simplemente usa el numero FEL
+        """
+        return str(self.serie_fel) + '-' + str(self.numero_fel)
+
     def num_a_letras(self, amount):
         return a_letras.num_a_letras(amount,completo=True)
 
@@ -53,7 +62,7 @@ class AccountMove(models.Model):
         factura = self
         requiere = factura.is_invoice() and factura.journal_id.generar_fel and factura.amount_total != 0
         if certificador:
-            requiere = requiere and ( factura.company_id.certificador_fel == certificador )
+            requiere = requiere and ( factura.company_id.certificador_fel == certificador or not factura.company_id.certificador_fel )
         return requiere
 
     def error_pre_validacion(self):
@@ -167,9 +176,13 @@ class AccountMove(models.Model):
         nit_receptor = 'CF'
         if factura.partner_id.vat:
             nit_receptor = factura.partner_id.vat.replace('-','')
+        if factura.partner_id.nit_facturacion_fel:
+            nit_receptor = factura.partner_id.nit_facturacion_fel.replace('-','')
         if tipo_documento_fel == "FESP" and factura.partner_id.cui:
             nit_receptor = factura.partner_id.cui
+            
         Receptor = etree.SubElement(DatosEmision, DTE_NS+"Receptor", IDReceptor=nit_receptor, NombreReceptor=factura.partner_id.name if not factura.partner_id.parent_id else factura.partner_id.parent_id.name)
+        
         if factura.partner_id.nombre_facturacion_fel:
             Receptor.attrib['NombreReceptor'] = factura.partner_id.nombre_facturacion_fel
         if factura.partner_id.email:
@@ -181,7 +194,7 @@ class AccountMove(models.Model):
 
         DireccionReceptor = etree.SubElement(Receptor, DTE_NS+"DireccionReceptor")
         Direccion = etree.SubElement(DireccionReceptor, DTE_NS+"Direccion")
-        Direccion.text = (factura.partner_id.street or '') + ' ' + (factura.partner_id.street2 or '')
+        Direccion.text = " ".join([x for x in (factura.partner_id.street, factura.partner_id.street2) if x]).strip() or 'Ciudad'
         CodigoPostal = etree.SubElement(DireccionReceptor, DTE_NS+"CodigoPostal")
         CodigoPostal.text = factura.partner_id.zip or '01001'
         Municipio = etree.SubElement(DireccionReceptor, DTE_NS+"Municipio")
@@ -192,11 +205,15 @@ class AccountMove(models.Model):
         Pais.text = factura.partner_id.country_id.code or 'GT'
         
         ElementoFrases = None
-        if tipo_documento_fel not in ['NDEB', 'NCRE', 'NABN', 'FESP']:
+        if tipo_documento_fel not in ['NABN', 'FESP']:
             ElementoFrases = etree.fromstring(factura.company_id.frases_fel)
-            if tipo_documento_fel not in ['FACT', 'FCAM']:
+            if datetime.now().isoformat() < '2022-10-31' and tipo_documento_fel not in ['FACT', 'FCAM']:
                 frase_isr = ElementoFrases.find('.//*[@TipoFrase="1"]')
-                ElementoFrases.remove(frase_isr)
+                if frase_isr is not None:
+                    ElementoFrases.remove(frase_isr)
+                frase_iva = ElementoFrases.find('.//*[@TipoFrase="2"]')
+                if frase_iva is not None:
+                    ElementoFrases.remove(frase_iva)
             DatosEmision.append(ElementoFrases)
 
         Items = etree.SubElement(DatosEmision, DTE_NS+"Items")
@@ -205,6 +222,7 @@ class AccountMove(models.Model):
         gran_subtotal = 0
         gran_total = 0
         gran_total_impuestos = 0
+        gran_total_impuestos_timbre = 0
         cantidad_impuestos = 0
         self.descuento_lineas()
         
@@ -222,15 +240,28 @@ class AccountMove(models.Model):
             precio_unitario = linea.price_unit * (100-linea.discount) / 100
             precio_sin_descuento = linea.price_unit
             descuento = precio_sin_descuento * linea.quantity - precio_unitario * linea.quantity
-            precio_unitario_base = linea.price_subtotal / linea.quantity
+            precio_unitario_base = precio_unitario
+            if linea.price_total != linea.price_subtotal:
+                precio_unitario_base = linea.price_subtotal / linea.quantity
             total_linea = precio_unitario * linea.quantity
             total_linea_base = precio_unitario_base * linea.quantity
             total_impuestos = total_linea - total_linea_base
             cantidad_impuestos += len(linea.tax_ids)
+            
+            total_impuestos_timbre = 0
+            
+            if len(linea.tax_ids) > 1:
+                impuestos = linea.tax_ids.compute_all(precio_unitario, currency=factura.currency_id, quantity=linea.quantity, product=linea.product_id, partner=factura.partner_id)
+                
+                for i in impuestos['taxes']:
+                    if re.search('timbre', i['name'], re.IGNORECASE):
+                        total_impuestos_timbre += i['amount']
+                        
+            total_linea += total_impuestos_timbre
 
             Item = etree.SubElement(Items, DTE_NS+"Item", BienOServicio=tipo_producto, NumeroLinea=str(linea_num))
             Cantidad = etree.SubElement(Item, DTE_NS+"Cantidad")
-            Cantidad.text = str(linea.quantity)
+            Cantidad.text = '{:.{p}f}'.format(linea.quantity, p=self.env['decimal.precision'].precision_get('Product Unit of Measure'))
             UnidadMedida = etree.SubElement(Item, DTE_NS+"UnidadMedida")
             UnidadMedida.text = linea.product_uom_id.name[0:3] if linea.product_uom_id else 'UNI'
             Descripcion = etree.SubElement(Item, DTE_NS+"Descripcion")
@@ -241,7 +272,7 @@ class AccountMove(models.Model):
             Precio.text = '{:.6f}'.format(precio_sin_descuento * linea.quantity)
             Descuento = etree.SubElement(Item, DTE_NS+"Descuento")
             Descuento.text = '{:.6f}'.format(descuento)
-            if tipo_documento_fel not in ['NABN', 'RECI']:
+            if tipo_documento_fel not in ['NABN', 'RECI', 'FPEQ']:
                 Impuestos = etree.SubElement(Item, DTE_NS+"Impuestos")
                 Impuesto = etree.SubElement(Impuestos, DTE_NS+"Impuesto")
                 NombreCorto = etree.SubElement(Impuesto, DTE_NS+"NombreCorto")
@@ -254,17 +285,31 @@ class AccountMove(models.Model):
                 MontoGravable.text = '{:.6f}'.format(total_linea_base)
                 MontoImpuesto = etree.SubElement(Impuesto, DTE_NS+"MontoImpuesto")
                 MontoImpuesto.text = '{:.6f}'.format(total_impuestos)
+                if not factura.currency_id.is_zero(total_impuestos_timbre):
+                    Impuesto = etree.SubElement(Impuestos, DTE_NS+"Impuesto")
+                    NombreCorto = etree.SubElement(Impuesto, DTE_NS+"NombreCorto")
+                    NombreCorto.text = "TIMBRE DE PRENSA"
+                    CodigoUnidadGravable = etree.SubElement(Impuesto, DTE_NS+"CodigoUnidadGravable")
+                    CodigoUnidadGravable.text = "1"
+                    MontoGravable = etree.SubElement(Impuesto, DTE_NS+"MontoGravable")
+                    MontoGravable.text = '{:.6f}'.format(total_linea_base)
+                    MontoImpuesto = etree.SubElement(Impuesto, DTE_NS+"MontoImpuesto")
+                    MontoImpuesto.text = '{:.6f}'.format(total_impuestos_timbre)
+                    
             Total = etree.SubElement(Item, DTE_NS+"Total")
             Total.text = '{:.6f}'.format(total_linea)
 
             gran_total += total_linea
             gran_subtotal += total_linea_base
             gran_total_impuestos += total_impuestos
+            gran_total_impuestos_timbre += total_impuestos_timbre
 
         Totales = etree.SubElement(DatosEmision, DTE_NS+"Totales")
-        if tipo_documento_fel not in ['NABN', 'RECI']:
+        if tipo_documento_fel not in ['NABN', 'RECI', 'FPEQ']:
             TotalImpuestos = etree.SubElement(Totales, DTE_NS+"TotalImpuestos")
             TotalImpuesto = etree.SubElement(TotalImpuestos, DTE_NS+"TotalImpuesto", NombreCorto="IVA", TotalMontoImpuesto='{:.6f}'.format(gran_total_impuestos))
+            if not factura.currency_id.is_zero(gran_total_impuestos_timbre):
+                TotalImpuestoTimbre = etree.SubElement(TotalImpuestos, DTE_NS+"TotalImpuesto", NombreCorto="TIMBRE DE PRENSA", TotalMontoImpuesto='{:.6f}'.format(gran_total_impuestos_timbre))
         GranTotal = etree.SubElement(Totales, DTE_NS+"GranTotal")
         GranTotal.text = '{:.6f}'.format(gran_total)
 
@@ -283,7 +328,7 @@ class AccountMove(models.Model):
                 Complemento = etree.SubElement(Complementos, DTE_NS+"Complemento", IDComplemento="ReferenciasNota", NombreComplemento="Nota de Credito" if tipo_documento_fel == 'NCRE' else "Nota de Debito", URIComplemento="http://www.sat.gob.gt/face2/ComplementoReferenciaNota/0.1.0")
                 if factura.factura_original_id.numero_fel:
                     ReferenciasNota = etree.SubElement(Complemento, CNO_NS+"ReferenciasNota", FechaEmisionDocumentoOrigen=str(factura.factura_original_id.invoice_date), MotivoAjuste=factura.motivo_fel or '-', NumeroAutorizacionDocumentoOrigen=factura.factura_original_id.firma_fel, NumeroDocumentoOrigen=factura.factura_original_id.numero_fel, SerieDocumentoOrigen=factura.factura_original_id.serie_fel, Version="0.0", nsmap=NSMAP_REF)
-                else:
+                elif factura.factura_original_id and factura.factura_original_id.ref and len(factura.factura_original_id.ref.split("-")) > 1:
                     ReferenciasNota = etree.SubElement(Complemento, CNO_NS+"ReferenciasNota", RegimenAntiguo="Antiguo", FechaEmisionDocumentoOrigen=str(factura.factura_original_id.invoice_date), MotivoAjuste=factura.motivo_fel or '-', NumeroAutorizacionDocumentoOrigen=factura.factura_original_id.firma_fel, NumeroDocumentoOrigen=factura.factura_original_id.ref.split("-")[1], SerieDocumentoOrigen=factura.factura_original_id.ref.split("-")[0], Version="0.0", nsmap=NSMAP_REF)
 
             if tipo_documento_fel in ['FCAM']:
@@ -323,9 +368,22 @@ class AccountMove(models.Model):
                 total_isr = abs(factura.amount_tax)
 
                 total_iva_retencion = 0
-                for impuesto in factura.amount_by_group:
-                    if impuesto[1] > 0:
-                        total_iva_retencion += impuesto[1]
+                
+                # Version 13, 14
+                if 'amount_by_group' in factura.fields_get():
+                    for impuesto in factura.amount_by_group:
+                        if impuesto[1] > 0:
+                            total_iva_retencion += impuesto[1]
+
+                # Version 15    
+                if 'tax_totals_json' in factura.fields_get():
+                    invoice_totals = json.loads(factura.tax_totals_json)
+                    logging.warn(invoice_totals)
+                    for grupos in invoice_totals['groups_by_subtotal'].values():
+                        logging.warn(grupos)
+                        for impuesto in grupos:
+                            if impuesto['tax_group_amount'] > 0:
+                                total_iva_retencion += impuesto['tax_group_amount']
 
                 Complemento = etree.SubElement(Complementos, DTE_NS+"Complemento", IDComplemento="FacturaEspecial", NombreComplemento="FacturaEspecial", URIComplemento="http://www.sat.gob.gt/face2/ComplementoFacturaEspecial/0.1.0")
                 RetencionesFacturaEspecial = etree.SubElement(Complemento, CFE_NS+"RetencionesFacturaEspecial", Version="1", nsmap=NSMAP_FE)
@@ -335,6 +393,9 @@ class AccountMove(models.Model):
                 RetencionIVA.text = str(total_iva_retencion)
                 TotalMenosRetenciones = etree.SubElement(RetencionesFacturaEspecial, CFE_NS+"TotalMenosRetenciones")
                 TotalMenosRetenciones.text = str(factura.amount_total)
+                
+        if ElementoFrases is not None and len(ElementoFrases) == 0:
+            DatosEmision.remove(ElementoFrases)
 
         # signature = xmlsig.template.create(
         #     xmlsig.constants.TransformInclC14N,
@@ -419,12 +480,9 @@ class AccountJournal(models.Model):
     tipo_documento_fel = fields.Selection([('FACT', 'FACT'), ('FCAM', 'FCAM'), ('FPEQ', 'FPEQ'), ('FCAP', 'FCAP'), ('FESP', 'FESP'), ('NABN', 'NABN'), ('RDON', 'RDON'), ('RECI', 'RECI'), ('NDEB', 'NDEB'), ('NCRE', 'NCRE')], 'Tipo de Documento FEL', copy=False)
     error_en_historial_fel = fields.Boolean('Registrar error FEL', help='Los errores no se muestran en pantalla, solo se registran en el historial')
     contingencia_fel = fields.Boolean('Habilitar contingencia FEL')
-    
-class ResCompany(models.Model):
-    _inherit = "res.company"
+    invoice_reference_type = fields.Selection(selection_add=[('fel', 'FEL')], ondelete=({'fel': 'set default'} if version_info[0] > 13 else ''))
 
-    certificador_fel = fields.Selection([], 'Certificador FEL')
-    afiliacion_iva_fel = fields.Selection([('GEN', 'GEN'), ('PEQ', 'PEQ'), ('EXE', 'EXE')], 'Afiliación IVA FEL', default='GEN')
-    frases_fel = fields.Text('Frases FEL')
-    adenda_fel = fields.Text('Adenda FEL')
-    
+class AccountTax(models.Model):
+    _inherit = 'account.tax'
+
+    tipo_impuesto_fel = fields.Selection([('IVA', 'IVA'), ('PETROLEO', 'PETROLEO'), ('TURISMO HOSPEDAJE', 'TURISMO HOSPEDAJE'), ('TURISMO PASAJES', 'TURISMO PASAJES'), ('TIMBRE DE PRENSA', 'TIMBRE DE PRENSA'), ('BOMBEROS', 'BOMBEROS'), ('TASA MUNICIPAL', 'TASA MUNICIPAL')], 'Tipo de Impuesto FEL', copy=False)
